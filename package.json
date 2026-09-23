@@ -1,0 +1,22 @@
+{
+  "name": "pi-desktop-workbuddy",
+  "version": "1.0.7",
+  "private": true,
+  "description": "PI-Desktop port of dsh-workbuddy-xdpool: every WorkBuddy desktop sign-in on this machine becomes one auto-failing-over model pool.",
+  "author": "eric8bit",
+  "homepage": "https://github.com/eric8bit/pi-desktop-workbuddy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eric8bit/pi-desktop-workbuddy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/eric8bit/pi-desktop-workbuddy/issues"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.9"
+  }
+}
