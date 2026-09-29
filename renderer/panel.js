@@ -113,8 +113,10 @@ var EN = {
   "dist.title": "Account usage",
   "dist.priority": "Priority",
   "dist.roundRobin": "Round-robin",
+  "dist.balanced": "Balanced",
   "dist.hintPriority": "Drain one account first, then move on to the next.",
   "dist.hintRoundRobin": "Spread the spend evenly across every account.",
+  "dist.hintBalanced": "Prefer accounts that have been idle longer.",
   "check.title": "Connection check",
   "check.empty": "Run the check to see whether a chat can reach WorkBuddy.",
   "foot.version": "v{version}",
@@ -222,8 +224,10 @@ var ZH = {
   "dist.title": "账号使用方式",
   "dist.priority": "优先用一个",
   "dist.roundRobin": "轮流使用",
+  "dist.balanced": "均衡使用",
   "dist.hintPriority": "先用完一个账号的额度，再换下一个。",
   "dist.hintRoundRobin": "把消耗均摊到每个账号上。",
+  "dist.hintBalanced": "优先使用空闲时间更久的账号。",
   "check.title": "连接检查",
   "check.empty": "运行检查可以看到对话能否连上 WorkBuddy。",
   "foot.version": "v{version}",
@@ -446,7 +450,7 @@ function renderDistribution() {
   clear(host);
   var byRegion = (state && state.distributionByRegion) || {};
   var current = byRegion[activeRegion] || (state && state.distribution) || "priority";
-  [["priority", "dist.priority"], ["round-robin", "dist.roundRobin"]].forEach(function (pair) {
+  [["priority", "dist.priority"], ["round-robin", "dist.roundRobin"], ["balanced", "dist.balanced"]].forEach(function (pair) {
     var button = el("button", current === pair[0] ? "active" : "", t(pair[1]));
     button.type = "button";
     button.setAttribute("aria-pressed", current === pair[0] ? "true" : "false");
@@ -454,7 +458,7 @@ function renderDistribution() {
     button.addEventListener("click", function () { setDistribution(pair[0]); });
     host.appendChild(button);
   });
-  $("distHint").textContent = current === "round-robin" ? t("dist.hintRoundRobin") : t("dist.hintPriority");
+  $("distHint").textContent = current === "round-robin" ? t("dist.hintRoundRobin") : current === "balanced" ? t("dist.hintBalanced") : t("dist.hintPriority");
 }
 
 function renderAccounts() {

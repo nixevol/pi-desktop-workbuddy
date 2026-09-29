@@ -121,6 +121,10 @@
           {
             "label": "轮流使用（把消耗均摊到每个账号）",
             "value": "round-robin"
+          },
+          {
+            "label": "均衡使用（优先空闲账号）",
+            "value": "balanced"
           }
         ]
       },
@@ -149,6 +153,27 @@
         "key": "modelSelection",
         "type": "json",
         "title": "模型选择（面板管理）",
+        "default": {},
+        "scope": "plugin"
+      },
+      {
+        "key": "exhaustCooldownSeconds",
+        "type": "number",
+        "title": "额度耗尽冷却时间（秒）",
+        "default": 1800,
+        "scope": "plugin"
+      },
+      {
+        "key": "disabledAccountIds",
+        "type": "json",
+        "title": "停用账号 ID 列表",
+        "default": [],
+        "scope": "plugin"
+      },
+      {
+        "key": "creditReserves",
+        "type": "json",
+        "title": "账号积分保留下限",
         "default": {},
         "scope": "plugin"
       }

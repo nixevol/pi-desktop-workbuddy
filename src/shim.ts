@@ -342,6 +342,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       const result = await client.chatStream(account.credential, prepared, controller.signal)
 
       if (result.ok) {
+        pool.noteServed(account.id)
         logger?.info?.(`dsh-workbuddy-xdpool: served by ${account.label}`)
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
@@ -372,6 +373,12 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       }
 
       // Rotate only on rate limits; other failures are terminal for this request.
+      // Credit exhaustion is account-wide; cool this account and try the next one.
+      if (result.kind === 'hard_credit') {
+        pool.penalizeExhausted(account.id)
+        continue
+      }
+
       if (result.kind !== 'soft_rate') break
 
       exhaustedByRateLimit = true

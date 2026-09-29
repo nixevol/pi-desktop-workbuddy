@@ -15,6 +15,13 @@ import { readFile, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { regionOf, type WorkBuddyRegion } from './upstream'
+import {
+  encryptedFieldKeyId,
+  isEncryptedFieldWrapper,
+  openEncryptedField,
+  readAtRestKey,
+  atRestKeyFor,
+} from './at-rest'
 
 /** Minimal upstream surface the pool needs to refresh a token (no circular import). */
 export interface TokenRefresher {
@@ -127,11 +134,79 @@ function optionalString(value: unknown): string | undefined {
 }
 
 /**
+ * Read one string-valued field that may arrive as a plain string (older builds)
+ * or as the desktop app's `$wbEncrypted` envelope. The app started encrypting
+ * `accessToken` / `refreshToken` / `nickname` in 5.6.0 on BOTH macOS and Windows
+ * — the earlier "Windows first" reading was wrong, and it is why a signed-in Mac
+ * showed no account at all: the value is an object, `typeof === 'string'` failed,
+ * and the parser reported "no credential" for a perfectly good sign-in.
+ *
+ * `decrypt` is injected rather than called here so this parser stays synchronous
+ * and testable; the async key fetch lives in `readCredential`. A field that IS
+ * encrypted but could not be opened is reported as `failed` rather than as an
+ * empty string — the caller must tell the user the app is missing or unreachable,
+ * not send them to sign in again (the one action that cannot help).
+ */
+/**
+ * Marker for "the credential is encrypted and we could not obtain the key".
+ *
+ * Carried as a `code` rather than left to `instanceof` because the value crosses
+ * the packaged-plugin boundary; the same convention the sibling error types use.
+ * This is deliberately NOT "not signed in": the user IS signed in, and telling
+ * them to sign in again sends them to the one action that cannot help.
+ */
+export const ENCRYPTED_CREDENTIAL_CODE = 'ENCRYPTED_CREDENTIAL'
+
+export class WorkBuddyEncryptedCredentialError extends Error {
+  readonly code = ENCRYPTED_CREDENTIAL_CODE
+  constructor(sourcePath: string) {
+    super(
+      `workbuddy: ${sourcePath} holds encrypted credentials, but no WorkBuddy desktop app could be located to provide the key.`
+        + ' If the app IS installed, it is simply outside the paths this plugin probes — set '
+        + 'WORKBUDDY_APP_EXECUTABLE to its full .exe path (then restart DSH) and the credential will open.'
+        + ' Signing in again will not help: the credential itself is intact. '
+        + 'Run `dsh-workbuddy-xdpool doctor` to see which paths were probed.',
+    )
+    this.name = 'WorkBuddyEncryptedCredentialError'
+  }
+}
+
+/** True when a thrown value is the encrypted-credential marker (cross-bundle safe). */
+export function isEncryptedCredentialError(value: unknown): boolean {
+  return typeof value === 'object' && value !== null
+    && (value as { code?: unknown }).code === ENCRYPTED_CREDENTIAL_CODE
+}
+
+function decryptableString(
+  value: unknown,
+  decrypt: ((field: unknown) => string) | undefined,
+): { value: string; encrypted: boolean; failed: boolean } {
+  if (typeof value === 'string') return { value, encrypted: false, failed: false }
+  if (isEncryptedFieldWrapper(value)) {
+    if (decrypt === undefined) return { value: '', encrypted: true, failed: true }
+    try {
+      return { value: decrypt(value), encrypted: true, failed: false }
+    } catch {
+      return { value: '', encrypted: true, failed: true }
+    }
+  }
+  return { value: '', encrypted: false, failed: false }
+}
+
+/**
  * Parse a WorkBuddy auth document. Accepts the nested desktop shape
  * `{"auth":{...},"account":{...}}` and the flat panel shape; returns undefined
  * when there is no usable access token.
+ *
+ * `decrypt` opens the desktop app's `$wbEncrypted` field wrapper (5.6.0+, both
+ * platforms). Absent means "plain-string builds only", which is what every
+ * caller without an at-rest key should pass.
  */
-export function parseWorkBuddyAuth(text: string, sourcePath: string): WorkBuddyCredential | undefined {
+export function parseWorkBuddyAuth(
+  text: string,
+  sourcePath: string,
+  decrypt?: (field: unknown) => string,
+): WorkBuddyCredential | undefined {
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
@@ -154,7 +229,14 @@ export function parseWorkBuddyAuth(text: string, sourcePath: string): WorkBuddyC
     identity = document
   }
 
-  const accessToken = typeof auth['accessToken'] === 'string' ? auth['accessToken'] : ''
+  const accessField = decryptableString(auth['accessToken'], decrypt)
+  // An encrypted-but-unopenable credential must NOT be reported as a readable
+  // one with an empty token: the caller has to distinguish "not signed in" from
+  // "signed in, but the app holding the key is missing".
+  if (accessField.encrypted && accessField.failed) {
+    throw new WorkBuddyEncryptedCredentialError(sourcePath)
+  }
+  const accessToken = accessField.value
   if (accessToken === '') return undefined
 
   // Skip documents whose refresh window has already closed: they cannot recover.
@@ -173,11 +255,13 @@ export function parseWorkBuddyAuth(text: string, sourcePath: string): WorkBuddyC
 
   return {
     accessToken,
-    refreshToken: typeof auth['refreshToken'] === 'string' ? auth['refreshToken'] : '',
+    refreshToken: decryptableString(auth['refreshToken'], decrypt).value,
     expiresAtMs: typeof auth['expiresAt'] === 'number' ? expiryToMs(auth['expiresAt']) : 0,
     ...refreshExpiresAtMs === undefined ? {} : { refreshExpiresAtMs },
     ...lastRefreshAtMs === undefined ? {} : { lastRefreshAtMs },
-    ...optionalString(identity['nickname']) === undefined ? {} : { nickname: optionalString(identity['nickname']) },
+    ...optionalString(decryptableString(identity['nickname'], decrypt).value) === undefined
+      ? {}
+      : { nickname: optionalString(decryptableString(identity['nickname'], decrypt).value) },
     ...optionalString(identity['uin']) === undefined ? {} : { uin: optionalString(identity['uin']) },
     ...optionalString(identity['uid']) === undefined ? {} : { uid: optionalString(identity['uid']) },
     ...optionalString(identity['enterpriseId']) === undefined
@@ -273,11 +357,95 @@ async function authFilesIn(dir: string): Promise<string[]> {
 }
 
 async function readCredential(path: string): Promise<WorkBuddyCredential | undefined> {
+  let text: string
   try {
-    return parseWorkBuddyAuth(await readFile(path, 'utf8'), path)
+    text = await readFile(path, 'utf8')
   } catch {
     return undefined
   }
+  // Fetch the app's at-rest key once per process, and only when the document
+  // actually carries an encrypted field: plain-string builds must not spawn the
+  // app at all. A missing key leaves `decrypt` undefined, which turns an
+  // encrypted field into a thrown `WorkBuddyEncryptedCredentialError` instead of
+  // a silent "no credential".
+  const decrypt = text.includes('"$wbEncrypted"') ? await encryptedFieldOpener() : undefined
+  try {
+    return parseWorkBuddyAuth(text, path, decrypt)
+  } catch (error: unknown) {
+    if (isEncryptedCredentialError(error)) throw error
+    return undefined
+  }
+}
+
+/**
+ * The pool id a document would receive, WITHOUT decrypting anything.
+ *
+ * Used to honour the ignore list before the at-rest key lookup runs: `uin` and
+ * `uid` are read as plain strings by {@link parseWorkBuddyAuth}, while
+ * `nickname` is commonly encrypted — so this returns undefined for an account
+ * whose identity lives only in the encrypted nickname, and the caller falls
+ * back to the full parse for those.
+ */
+export function cheapIdentityId(text: string): string | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+  const document = parsed as Record<string, unknown>
+  const identity =
+    typeof document['account'] === 'object' && document['account'] !== null
+      ? (document['account'] as Record<string, unknown>)
+      : document
+  const uin = typeof identity['uin'] === 'string' && identity['uin'] !== '' ? identity['uin'] : undefined
+  const uid = typeof identity['uid'] === 'string' && identity['uid'] !== '' ? identity['uid'] : undefined
+  if (uin === undefined && uid === undefined) return undefined
+  // `workbuddyAccountId` reads `uin` first, exactly as the full parse does, so
+  // this cheap id agrees with the id the account would really be filed under.
+  return workbuddyAccountId({ ...uin === undefined ? {} : { uin }, ...uid === undefined ? {} : { uid } })
+}
+
+/** {@link cheapIdentityId} for a file path; undefined when it cannot be read. */
+async function cheapIdentityIdFromFile(path: string): Promise<string | undefined> {
+  try {
+    return cheapIdentityId(await readFile(path, 'utf8'))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Build the field opener, or undefined when the app cannot supply its key.
+ *
+ * Split out so the key lookup is testable without a real desktop install, and so
+ * a lookup failure degrades to "encrypted, unopenable" rather than to a parse
+ * error that would look like a corrupt file.
+ */
+export async function encryptedFieldOpener(): Promise<((field: unknown) => string) | undefined> {
+  // Warm the per-key-id cache so the synchronous closure below can resolve each
+  // field's own key. Each encrypted field names the key id it was sealed under
+  // (WorkBuddyEncryptedField.envelope.keyId); when more than one desktop build
+  // (domestic and international) is installed on one machine, every build yields
+  // its key here and the field selects its own. A build that fails to answer is
+  // skipped on its own (mirroring the reference provideTheKey), so one bad spawn
+  // cannot hide the others behind a process-wide undefined key.
+  await readAtRestKey().catch(() => undefined)
+  return (field: unknown) => {
+    if (!isEncryptedFieldWrapper(field)) throw new Error('workbuddy: not an encrypted field wrapper')
+    const keyId = encryptedFieldKeyId(field)
+    if (keyId === undefined) throw new Error('workbuddy: encrypted field has no key id')
+    const key = atRestKeyFor(keyId)
+    if (key === undefined) throw new Error('workbuddy: no at-rest key available for this encrypted field')
+    return openEncryptedField(field, key)
+  }
+}
+
+// Warm the key cache for any installed build before the first parse, so a field
+// resolves synchronously inside the opener above. Exposed for tests/diagnostics.
+export async function primeAtRestKeys(): Promise<void> {
+  await readAtRestKey().catch(() => undefined)
 }
 
 /** Every directory the pool should scan, in probe order. */
@@ -293,7 +461,7 @@ export function candidateAuthDirs(env: NodeJS.ProcessEnv = process.env): string[
 }
 
 /** How the pool chooses which account serves the next request. */
-export type AccountDistribution = 'priority' | 'round-robin'
+export type AccountDistribution = 'priority' | 'round-robin' | 'balanced'
 
 export interface AccountPoolOptions {
   /** Logger for discovery and rotation events. */
@@ -302,6 +470,8 @@ export interface AccountPoolOptions {
   authDirs?: readonly string[]
   /** How long a rate-limited account stays out of rotation. */
   cooldownMs?: number
+  /** How long an account rests after its credits run out (default 30 minutes). */
+  exhaustCooldownMs?: number
   /** Upstream client used to refresh near-expiry tokens. */
   client?: TokenRefresher
   /** Refresh this long before actual expiry; default five minutes. */
@@ -323,10 +493,43 @@ export interface AccountPoolOptions {
  * Read-only pool of every discovered WorkBuddy account, with rate-limit
  * cooldown and round-robin failover.
  */
+/** Idle bonus per hour an account has been unused (reference-panel default). */
+const IDLE_WEIGHT_PER_HOUR = 0.5
+/** Ceiling for the idle bonus, so an idle account cannot dominate forever. */
+const IDLE_WEIGHT_MAX = 5
+
+/**
+ * Weight one account by how long it has been idle.
+ *
+ * The base of 1 keeps every eligible account in play: an account that served a
+ * moment ago still has a small chance, so a single unhealthy account cannot pin
+ * the pool to itself, and the weights never sum to zero.
+ *
+ * `lastUsedAt === undefined` means "never used in this process", which earns the
+ * full bonus: on a fresh start every account ties, and the weighted draw spreads
+ * the first requests instead of always picking the first entry.
+ */
+function idleWeight(lastUsedAt: number | undefined, now: number): number {
+  if (lastUsedAt === undefined) return 1 + IDLE_WEIGHT_MAX
+  const hours = (now - lastUsedAt) / 3_600_000
+  // A clock jump backwards would produce a negative idle term; clamp to 0.
+  const idle = Math.min(Math.max(hours, 0) * IDLE_WEIGHT_PER_HOUR, IDLE_WEIGHT_MAX)
+  return 1 + idle
+}
+
+/** Default rest for an account whose credits ran out (packs reset on their own schedule). */
+const EXHAUST_COOLDOWN_MS = 30 * 60 * 1000
+
 export class WorkBuddyAccountPool {
   private readonly logger: AccountPoolOptions['logger']
   private authDirs: readonly string[]
   private cooldownMs: number
+  /**
+   * How long an account stays out of rotation after the upstream reports its
+   * credits are spent. Credit packs reset on their own schedule rather than on a
+   * rate-limit window, so this is much longer than `cooldownMs`.
+   */
+  private exhaustCooldownMs: number
   private readonly client: TokenRefresher | undefined
   private readonly refreshMarginMs: number
   private accounts: WorkBuddyAccount[] = []
@@ -335,12 +538,65 @@ export class WorkBuddyAccountPool {
   private cursor = 0
   private lastScanAtMs = 0
   private preferredId: string | undefined
+  /**
+   * Account ids the user switched off on the card.
+   *
+   * Disabling is a user preference rather than a property of the credential:
+   * `scan()` rebuilds every account object from the auth files, so the set
+   * lives on the pool and is re-applied from settings after each scan.
+   */
+  private disabledIds = new Set<string>()
+  /**
+   * Account ids the user threw out of the pool for good.
+   *
+   * Enforced BEFORE the credential is parsed: `scan()` skips a file whose
+   * identity is already ignored, so an ignored account costs no at-rest key
+   * lookup (which spawns the desktop app on 5.6.0+) and cannot re-enter the pool
+   * when the app writes a fresh sign-in for it. That is the difference from
+   * {@link disabledIds}, which only filters at pick time and leaves the account
+   * listed, readable and re-discoverable.
+   *
+   * The set is supplied by the host from the plugin's own ignore file, and is
+   * replaced wholesale on every {@link applyIgnored} so removing an entry takes
+   * effect on the next scan without a restart.
+   */
+  private ignoredIds = new Set<string>()
+  /**
+   * Per-account credit floor, keyed by account id. 0 (or absent) means "spend
+   * it all".
+   *
+   * A reserved balance is protection, not a hard limit the upstream knows
+   * about: the pool simply stops picking that account once its last known
+   * balance is at or below the floor, so the user keeps a cushion instead of
+   * draining every account to zero.
+   */
+  private creditReserves = new Map<string, number>()
+  /**
+   * Last known credit balance per account, epoch ms aside.
+   *
+   * Refreshed in the background after a successful request, so a pick can
+   * consult it. An account with no reading is treated as usable: refusing to
+   * pick an account just because its balance has not been checked yet would
+   * strand a healthy pool, and the first 402 still cools it as before.
+   */
+  private creditBalances = new Map<string, number>()
+  /**
+   * Last time each account served a request, epoch ms. Drives the idle term
+   * of the priority-mode weighting below: an account that just served loses to
+   * one that has been idle, so a small pool stops hammering a single account.
+   *
+   * In-memory on purpose: it only biases the next pick, so a cold start that
+   * treats every account as idle is the right default. Not keyed by id lookup
+   * misses because a removed account simply disappears from the map on re-scan.
+   */
+  private lastUsedAt = new Map<string, number>()
   private refreshInflight = new Map<string, Promise<void>>()
 
   constructor(options: AccountPoolOptions = {}) {
     this.logger = options.logger
     this.authDirs = options.authDirs ?? candidateAuthDirs()
     this.cooldownMs = options.cooldownMs ?? 60_000
+    this.exhaustCooldownMs = options.exhaustCooldownMs ?? EXHAUST_COOLDOWN_MS
     this.client = options.client
     this.refreshMarginMs = options.refreshMarginMs ?? 5 * 60 * 1000
     // Priority is the default: users pool their own accounts to spend one
@@ -356,7 +612,11 @@ export class WorkBuddyAccountPool {
   applyConfig(options: {
     authDirs?: readonly string[]
     cooldownMs?: number
+    exhaustCooldownMs?: number
     distribution?: AccountDistribution
+    disabledAccountIds?: readonly string[]
+    /** Per-account credit floor, keyed by account id. Absent keeps the current map. */
+    creditReserves?: Readonly<Record<string, number>>
   }): void {
     if (options.authDirs !== undefined && options.authDirs.length > 0) {
       this.authDirs = options.authDirs
@@ -364,9 +624,41 @@ export class WorkBuddyAccountPool {
     if (options.cooldownMs !== undefined && options.cooldownMs >= 1000) {
       this.cooldownMs = options.cooldownMs
     }
+    if (options.exhaustCooldownMs !== undefined && options.exhaustCooldownMs >= 1000) {
+      this.exhaustCooldownMs = options.exhaustCooldownMs
+    }
     if (options.distribution !== undefined) {
       this.distribution = options.distribution
     }
+    if (options.disabledAccountIds !== undefined) {
+      this.disabledIds = new Set(options.disabledAccountIds)
+    }
+    // Reserves are replaced wholesale so the map mirrors the saved document.
+    if (options.creditReserves !== undefined) this.setCreditReserves(options.creditReserves)
+  }
+
+  /**
+   * Replace the permanent ignore list.
+   *
+   * Also drops any already-discovered account that is now ignored, so the change
+   * is visible without waiting for the next scan: the card refreshes its status
+   * document right after the write, and an account still sitting in `accounts`
+   * would keep showing up there.
+   */
+  applyIgnored(ids: Iterable<string>): void {
+    this.ignoredIds = new Set(ids)
+    if (this.ignoredIds.size === 0) return
+    this.accounts = this.accounts.filter(account => !this.ignoredIds.has(account.id))
+  }
+
+  /** Whether this account has been thrown out of the pool for good. */
+  isIgnored(accountId: string): boolean {
+    return this.ignoredIds.has(accountId)
+  }
+
+  /** Every ignored id currently in force, in insertion order. */
+  ignoredIdsInOrder(): string[] {
+    return [...this.ignoredIds]
   }
 
   /** Rescan the auth directories and merge newly discovered accounts. */
@@ -374,8 +666,22 @@ export class WorkBuddyAccountPool {
     const found: WorkBuddyCredential[] = []
     for (const dir of this.authDirs) {
       for (const file of await authFilesIn(dir)) {
+        // Honour the ignore list BEFORE reading the document's key material.
+        // `cheapIdentityId` reads only the plain `uin`/`uid` fields, so an
+        // ignored account is skipped without spawning the desktop app for its
+        // at-rest key. A document whose identity lives in an encrypted nickname
+        // returns undefined here and is checked again after the full parse
+        // below — slower, but never wrongly admitted.
+        if (this.ignoredIds.size > 0) {
+          const cheapId = await cheapIdentityIdFromFile(file)
+          if (cheapId !== undefined && this.ignoredIds.has(cheapId)) continue
+        }
         const credential = await readCredential(file)
-        if (credential !== undefined) found.push(credential)
+        if (credential === undefined) continue
+        // Second gate: the cheap probe could not identify this file, so the
+        // ignored check happens now that the credential is fully parsed.
+        if (this.ignoredIds.size > 0 && this.ignoredIds.has(workbuddyAccountId(credential))) continue
+        found.push(credential)
       }
     }
 
@@ -420,7 +726,6 @@ export class WorkBuddyAccountPool {
   list(region?: WorkBuddyRegion): readonly WorkBuddyAccount[] {
     if (region === undefined) return this.accounts
     return this.accounts.filter(account => regionOf(account.credential.domain) === region)
-    return this.accounts
   }
 
   /**
@@ -434,6 +739,17 @@ export class WorkBuddyAccountPool {
    */
   private available(now: number, modelId?: string, region?: WorkBuddyRegion): WorkBuddyAccount[] {
     return this.accounts.filter(account => {
+      // Switched off on the card: never serves a request, but still listed so
+      // the card can switch it back on.
+      if (this.disabledIds.has(account.id)) return false
+      // Reserved credits: stop picking an account once its last known balance
+      // reached the floor the user set for it. An account with no reading stays
+      // in play (see creditBalances), so an unprobed pool is not stranded.
+      const reserve = this.creditReserves.get(account.id)
+      if (reserve !== undefined && reserve > 0) {
+        const balance = this.creditBalances.get(account.id)
+        if (balance !== undefined && balance <= reserve) return false
+      }
       if (account.cooldownUntilMs > now) return false
       if (modelId !== undefined && (account.modelCooldowns[modelId] ?? 0) > now) return false
       // A region-scoped caller (one of the two providers) must never pick
@@ -441,6 +757,42 @@ export class WorkBuddyAccountPool {
       if (region !== undefined && regionOf(account.credential.domain) !== region) return false
       return true
     })
+  }
+
+  /** Round-robin: the legacy cursor walk, kept for the distribution that asks for it. */
+  private pickRoundRobin(pool: readonly WorkBuddyAccount[]): WorkBuddyAccount | undefined {
+    const index = this.cursor % pool.length
+    const account = pool[index]
+    if (account === undefined) return undefined
+    this.cursor = (index + 1) % pool.length
+    return account
+  }
+
+  /**
+   * Priority mode: weighted random over the eligible accounts.
+   *
+   * The weight is an idle bonus — `1 + min(idleHours * perHour, max)` — so an
+   * account that has never served (or has been idle for a while) outranks one
+   * that just answered. Reference panel logic drops its success-rate term
+   * entirely because a lifetime error counter penalises an account forever;
+   * instantaneous health is already handled by cooldowns, which is why those
+   * accounts never reach this list.
+   *
+   * A pool with no idle history (fresh process) hashes to equal weights, which
+   * spreads the very first picks instead of always returning index 0.
+   */
+  private pickByWeight(pool: readonly WorkBuddyAccount[]): WorkBuddyAccount | undefined {
+    if (pool.length === 1) return pool[0]
+    const now = Date.now()
+    const weights = pool.map((account) => idleWeight(this.lastUsedAt.get(account.id), now))
+    const total = weights.reduce((sum, weight) => sum + weight, 0)
+    if (!Number.isFinite(total) || total <= 0) return pool[0]
+    let roll = Math.random() * total
+    for (let index = 0; index < pool.length; index += 1) {
+      roll -= weights[index] ?? 0
+      if (roll < 0) return pool[index]
+    }
+    return pool[pool.length - 1]
   }
 
   /**
@@ -472,25 +824,30 @@ export class WorkBuddyAccountPool {
     }
     if (pool.length === 0) return undefined
 
-    // The user's explicit pick leads; otherwise the discovery order stands.
+    // An explicit pick wins outright when it is eligible. Reordering the list
+    // is not enough now that priority mode draws by weight: the user asked for
+    // one account, so the draw should not be able to pick another.
     if (this.preferredId !== undefined) {
-      const preferredIndex = pool.findIndex(account => account.id === this.preferredId)
-      if (preferredIndex > 0) {
-        const [preferred] = pool.splice(preferredIndex, 1)
-        if (preferred !== undefined) pool = [preferred, ...pool]
+      const preferred = pool.find(account => account.id === this.preferredId)
+      if (preferred !== undefined) {
+        await this.ensureFresh(preferred)
+        return preferred
       }
     }
 
-    // `pool` is already filtered to accounts that can serve this model right
-    // now, so the head is the highest-priority account that is not cooling.
-    const index = this.distribution === 'round-robin'
-      ? this.cursor % pool.length
-      : 0
-    const account = pool[index]
+    // `priority` keeps the original behaviour: the head of the ordered list
+    // answers until it is limited, which is what a pool of your own accounts is
+    // for. `round-robin` walks the cursor. `balanced` draws by weight so a quiet
+    // pool spreads across accounts instead of draining the first one.
+    const account = this.distribution === 'round-robin'
+      ? this.pickRoundRobin(pool)
+      : this.distribution === 'balanced'
+        ? this.pickByWeight(pool)
+        : pool[0]
+    // Serving is recorded by noteServed once the upstream answers 200, not
+    // here: picking only says which account is being tried, and the shim may
+    // still rotate before the request succeeds.
     if (account === undefined) return undefined
-    if (this.distribution === 'round-robin') {
-      this.cursor = (index + 1) % pool.length
-    }
     await this.ensureFresh(account)
     return account
   }
@@ -503,6 +860,108 @@ export class WorkBuddyAccountPool {
 
   prefer(accountId: string | undefined): void {
     this.preferredId = accountId
+  }
+
+  /** Whether the user switched this account off on the card. */
+  isDisabled(accountId: string): boolean {
+    return this.disabledIds.has(accountId)
+  }
+
+  /** Every account id the user switched off, in discovery order. */
+  disabledIdsInOrder(): string[] {
+    return this.accounts.filter(account => this.disabledIds.has(account.id)).map(account => account.id)
+  }
+
+  /**
+   * Record that an account actually served a request.
+   *
+   * Called by the shim once the upstream answers 200 — only then is the account
+   * the one the user is really being served by. `balanced` mode reads the same map
+   * for its idle weighting, so a request that failed over to another account must
+   * not count as used for the account that was merely tried.
+   */
+  noteServed(accountId: string): void {
+    if (!this.accounts.some(account => account.id === accountId)) return
+    this.lastUsedAt.set(accountId, Date.now())
+  }
+
+  /**
+   * Record an account latest known credit balance.
+   *
+   * Called after a request and by the card balance refresh, so the reserve
+   * check has something to compare against. A reading for an unknown account is
+   * dropped: `scan()` rebuilds the account list and a stale id would otherwise
+   * accumulate forever.
+   */
+  noteCredits(accountId: string, balance: number): void {
+    if (!Number.isFinite(balance)) return
+    if (!this.accounts.some(account => account.id === accountId)) return
+    this.creditBalances.set(accountId, balance)
+  }
+
+  /** Last known balance for one account, or undefined when never read. */
+  creditsOf(accountId: string): number | undefined {
+    return this.creditBalances.get(accountId)
+  }
+
+  /** The credit floor the user set for one account; 0 when unset. */
+  creditReserveOf(accountId: string): number {
+    return this.creditReserves.get(accountId) ?? 0
+  }
+
+  /**
+   * Replace every reserve. Called from settings on each apply, so the map
+   * mirrors the saved document exactly instead of accumulating old keys.
+   */
+  setCreditReserves(reserves: Readonly<Record<string, number>>): void {
+    const next = new Map<string, number>()
+    for (const [id, value] of Object.entries(reserves)) {
+      if (Number.isFinite(value) && value > 0) next.set(id, Math.floor(value))
+    }
+    this.creditReserves = next
+  }
+
+  /** Every reserve currently in force, keyed by account id. */
+  creditReservesInOrder(): Record<string, number> {
+    const out: Record<string, number> = {}
+    for (const account of this.accounts) {
+      const reserve = this.creditReserves.get(account.id)
+      if (reserve !== undefined && reserve > 0) out[account.id] = reserve
+    }
+    return out
+  }
+
+  /**
+   * Whether an account is held back only by its reserve.
+   *
+   * Separates "resting to protect credits" from every other reason an account
+   * is out of rotation, which is what the card shows the user.
+   */
+  isReserved(accountId: string): boolean {
+    const reserve = this.creditReserves.get(accountId)
+    if (reserve === undefined || reserve <= 0) return false
+    const balance = this.creditBalances.get(accountId)
+    return balance !== undefined && balance <= reserve
+  }
+
+  /**
+   * The account that served the most recent request, if any.
+   *
+   * Distinct from "who would serve the next one": this is a record of what
+   * actually happened, which is what the card needs to answer "which account am
+   * I using right now?". Under `balanced` there is no deterministic next account
+   * at all, so a recorded fact is the only honest answer.
+   *
+   * Returns undefined before the first request of the process, and after every
+   * known account has been re-scanned away (a login swapped out under us).
+   */
+  lastServedId(): string | undefined {
+    let newest: { id: string; at: number } | undefined
+    for (const [id, at] of this.lastUsedAt) {
+      if (!this.accounts.some(account => account.id === id)) continue
+      if (newest === undefined || at > newest.at) newest = { id, at }
+    }
+    return newest?.id
   }
 
   /** Best-effort refresh of one account after a session-dead upstream answer. */
@@ -563,6 +1022,21 @@ export class WorkBuddyAccountPool {
     }
   }
 
+  /**
+   * Cool a whole account after the upstream reports its credits are spent.
+   *
+   * Credit exhaustion is an ACCOUNT condition, unlike a model rate limit: every
+   * model on that account is unusable until the quota resets, so this cools the
+   * account as a whole (no `modelId`) for the configured exhaustion window. The
+   * shim then rotates to a different account instead of failing the request.
+   */
+  penalizeExhausted(accountId: string): void {
+    const until = Date.now() + this.exhaustCooldownMs
+    this.penalize(accountId, until)
+    this.logger?.warn(
+      `dsh-workbuddy-xdpool: account credits exhausted; cooling the whole account until ${new Date(until).toISOString()}`,
+    )
+  }
   /**
    * Mark an account (or one of its models) rate-limited.
    *

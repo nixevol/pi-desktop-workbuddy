@@ -258,7 +258,7 @@ function cooldownMs() {
  * gateways, so this cannot be a per-gateway switch.
  */
 function distributionSetting() {
-  return settings.distribution === "round-robin" ? "round-robin" : "priority";
+  return settings.distribution === "balanced" ? "balanced" : settings.distribution === "round-robin" ? "round-robin" : "priority";
 }
 
 /**
@@ -833,15 +833,25 @@ async function refreshAll(reason, force) {
 }
 
 /** Push the settings that affect discovery, cooldown and the picker. */
+function exhaustCooldownMs() {
+  const value = Number(settings.exhaustCooldownSeconds)
+  if (!Number.isFinite(value) || value <= 0) return 30 * 60 * 1000
+  return Math.max(1000, Math.min(24 * 60 * 60 * 1000, Math.round(value * 1000)))
+}
+
 function applySettingsToCore() {
-  const authFile = typeof settings.authFile === "string" ? settings.authFile.trim() : "";
+  const authFile = typeof settings.authFile === "string" ? settings.authFile.trim() : ""
   core.pool.applyConfig({
     ...authFile === "" ? {} : { authDirs: [path.dirname(authFile)] },
     cooldownMs: cooldownMs(),
+    exhaustCooldownMs: exhaustCooldownMs(),
     distribution: distributionSetting(),
-  });
+    ...Array.isArray(settings.disabledAccountIds) ? { disabledAccountIds: settings.disabledAccountIds } : {},
+    ...settings.creditReserves && typeof settings.creditReserves === "object" && !Array.isArray(settings.creditReserves)
+      ? { creditReserves: settings.creditReserves } : {},
+  })
   for (const region of REGIONS) {
-    applyEffectiveSelection(region);
+    applyEffectiveSelection(region)
   }
 }
 
@@ -871,6 +881,7 @@ async function accountProbe(account, allowNetwork) {
   const value = {};
   try {
     const credits = await core.client.fetchCredits(account.credential);
+    core.pool.noteCredits(account.id, credits.total);
     value.credits = {
       ...credits.total === undefined ? {} : { total: credits.total },
       packages: (credits.packages || []).map((pack) => ({
@@ -942,6 +953,9 @@ async function statusDocument(options) {
         id: account.id,
         label: account.label,
         ...account.credential.nickname === undefined ? {} : { nickname: account.credential.nickname },
+        disabled: core.pool.isDisabled(account.id),
+        reserved: core.pool.isReserved(account.id),
+        creditReserve: core.pool.creditReserveOf(account.id),
         region,
         domain: account.credential.domain,
         ...account.credential.expiresAtMs === 0
@@ -1380,7 +1394,7 @@ async function onPanelInvoke(channel, payload) {
     }
 
     case "xd.distribution": {
-      const next = payload?.distribution === "round-robin" ? "round-robin" : "priority";
+      const next = payload?.distribution === "balanced" ? "balanced" : payload?.distribution === "round-robin" ? "round-robin" : "priority";
       const stored = await saveSettings({ distribution: next });
       if (stored !== true) {
         throw panelError("the usage mode could not be written to the plugin settings file", "SAVE_FAILED");
